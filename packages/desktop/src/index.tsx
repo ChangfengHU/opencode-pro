@@ -56,7 +56,7 @@ const emitDeepLinks = (urls: string[]) => {
 const listenForDeepLinks = async () => {
   const startUrls = await getCurrent().catch(() => null)
   if (startUrls?.length) emitDeepLinks(startUrls)
-  await onOpenUrl((urls) => emitDeepLinks(urls)).catch(() => undefined)
+  await onOpenUrl((urls: string[]) => emitDeepLinks(urls)).catch(() => undefined)
 }
 
 const createPlatform = (password: Accessor<string | null>): Platform => ({
