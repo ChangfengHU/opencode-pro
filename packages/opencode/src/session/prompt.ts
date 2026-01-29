@@ -99,9 +99,9 @@ export namespace SessionPrompt {
     let size = 0
     for (const part of parts) {
       types[part.type] = (types[part.type] ?? 0) + 1
-      if (part.type === "text") size += part.text.length
+      if (part.type === "text" && part.text) size += part.text.length
       if (part.type === "file" && part.filename) size += part.filename.length
-      if (part.type === "agent") size += part.name.length
+      if (part.type === "agent" && part.name) size += part.name.length
     }
     return { count: parts.length, types, size }
   }
