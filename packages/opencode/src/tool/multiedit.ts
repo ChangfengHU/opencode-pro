@@ -4,6 +4,9 @@ import { EditTool } from "./edit"
 import DESCRIPTION from "./multiedit.txt"
 import path from "path"
 import { Instance } from "../project/instance"
+import { Log } from "../util/log"
+
+const log = Log.create({ service: "multiedit-tool" })
 
 export const MultiEditTool = Tool.define("multiedit", {
   description: DESCRIPTION,
@@ -21,6 +24,11 @@ export const MultiEditTool = Tool.define("multiedit", {
       .describe("Array of edit operations to perform sequentially on the file"),
   }),
   async execute(params, ctx) {
+    log.info("核心/文件/批量编辑开始", {
+      sessionID: ctx.sessionID,
+      file: params.filePath,
+      edits: params.edits.length,
+    })
     const tool = await EditTool.init()
     const results = []
     for (const [, edit] of params.edits.entries()) {
@@ -35,6 +43,11 @@ export const MultiEditTool = Tool.define("multiedit", {
       )
       results.push(result)
     }
+    log.info("核心/文件/批量编辑结束", {
+      sessionID: ctx.sessionID,
+      file: params.filePath,
+      edits: params.edits.length,
+    })
     return {
       title: path.relative(Instance.worktree, params.filePath),
       metadata: {

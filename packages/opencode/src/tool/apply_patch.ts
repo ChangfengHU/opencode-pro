@@ -13,6 +13,9 @@ import { LSP } from "../lsp"
 import { Filesystem } from "../util/filesystem"
 import DESCRIPTION from "./apply_patch.txt"
 import { File } from "../file"
+import { Log } from "../util/log"
+
+const log = Log.create({ service: "apply-patch-tool" })
 
 const PatchParams = z.object({
   patchText: z.string().describe("The full patch text that describes all changes to be made"),
@@ -25,6 +28,10 @@ export const ApplyPatchTool = Tool.define("apply_patch", {
     if (!params.patchText) {
       throw new Error("patchText is required")
     }
+    log.info("核心/文件/补丁开始", {
+      sessionID: ctx.sessionID,
+      size: params.patchText.length,
+    })
 
     // Parse the patch to get hunks
     let hunks: Patch.Hunk[]
@@ -268,6 +275,12 @@ export const ApplyPatchTool = Tool.define("apply_patch", {
       }
     }
 
+    log.info("核心/文件/补丁结束", {
+      sessionID: ctx.sessionID,
+      files: fileChanges.length,
+      additions: fileChanges.reduce((sum, item) => sum + item.additions, 0),
+      deletions: fileChanges.reduce((sum, item) => sum + item.deletions, 0),
+    })
     return {
       title: output,
       metadata: {

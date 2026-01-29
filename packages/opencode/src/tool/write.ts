@@ -12,9 +12,11 @@ import { Filesystem } from "../util/filesystem"
 import { Instance } from "../project/instance"
 import { trimDiff } from "./edit"
 import { assertExternalDirectory } from "./external-directory"
+import { Log } from "../util/log"
 
 const MAX_DIAGNOSTICS_PER_FILE = 20
 const MAX_PROJECT_DIAGNOSTICS_FILES = 5
+const log = Log.create({ service: "write-tool" })
 
 export const WriteTool = Tool.define("write", {
   description: DESCRIPTION,
@@ -29,6 +31,12 @@ export const WriteTool = Tool.define("write", {
     const file = Bun.file(filepath)
     const exists = await file.exists()
     const contentOld = exists ? await file.text() : ""
+    log.info("核心/文件/写入开始", {
+      sessionID: ctx.sessionID,
+      file: filepath,
+      exists,
+      size: params.content.length,
+    })
     if (exists) await FileTime.assert(ctx.sessionID, filepath)
 
     const diff = trimDiff(createTwoFilesPatch(filepath, filepath, contentOld, params.content))
@@ -72,6 +80,12 @@ export const WriteTool = Tool.define("write", {
       output += `\n\nLSP errors detected in other files:\n<diagnostics file="${file}">\n${limited.map(LSP.Diagnostic.pretty).join("\n")}${suffix}\n</diagnostics>`
     }
 
+    log.info("核心/文件/写入结束", {
+      sessionID: ctx.sessionID,
+      file: filepath,
+      exists,
+      size: params.content.length,
+    })
     return {
       title: path.relative(Instance.worktree, filepath),
       metadata: {

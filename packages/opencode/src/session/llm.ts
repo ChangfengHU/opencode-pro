@@ -27,6 +27,7 @@ import { Auth } from "@/auth"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
+  const FULL_LOG = process.env.OPENCODE_LOG_LLM_FULL === "1"
 
   export const OUTPUT_TOKEN_MAX = Flag.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX || 32_000
 
@@ -44,6 +45,73 @@ export namespace LLM {
   }
 
   export type StreamOutput = StreamTextResult<ToolSet, unknown>
+
+  const LOG_PREVIEW = 2000
+  const LOG_DEPTH = 6
+
+  function clipText(text: string, limit = LOG_PREVIEW) {
+    const size = text.length
+    if (size <= limit) {
+      return { text, size, clipped: false }
+    }
+    return { text: text.slice(0, limit) + "...", size, clipped: true }
+  }
+
+  function isSecretKey(key: string) {
+    const lower = key.toLowerCase()
+    if (lower.includes("authorization")) return true
+    if (lower.includes("apikey")) return true
+    if (lower.includes("api_key")) return true
+    if (lower.includes("token")) return true
+    if (lower.includes("secret")) return true
+    if (lower.includes("password")) return true
+    if (lower.includes("cookie")) return true
+    return lower.includes("key")
+  }
+
+  function redactValue(value: unknown, depth = 0): unknown {
+    if (value === null || value === undefined) return value
+    if (depth >= LOG_DEPTH) return "[max-depth]"
+    if (typeof value === "string") return clipText(value)
+    if (Array.isArray(value)) return value.map((item) => redactValue(item, depth + 1))
+    if (typeof value !== "object") return value
+    const record = value as Record<string, unknown>
+    const result: Record<string, unknown> = {}
+    for (const key of Object.keys(record)) {
+      if (isSecretKey(key)) {
+        result[key] = "[redacted]"
+        continue
+      }
+      result[key] = redactValue(record[key], depth + 1)
+    }
+    return result
+  }
+
+  function summarizeMessages(messages: ModelMessage[]) {
+    const roles: Record<string, number> = {}
+    const summary = {
+      count: messages.length,
+      roles,
+      parts: 0,
+      chars: 0,
+      toolCalls: 0,
+    }
+    for (const msg of messages) {
+      roles[msg.role] = (roles[msg.role] ?? 0) + 1
+      const content = msg.content
+      if (typeof content === "string") {
+        summary.chars += content.length
+        continue
+      }
+      if (!Array.isArray(content)) continue
+      summary.parts += content.length
+      for (const part of content) {
+        if (part.type === "text") summary.chars += part.text.length
+        if (part.type === "tool-call" || part.type === "tool-result") summary.toolCalls += 1
+      }
+    }
+    return summary
+  }
 
   export async function stream(input: StreamInput) {
     const l = log
@@ -150,14 +218,21 @@ export namespace LLM {
       },
     )
 
-    const maxOutputTokens = isCodex
-      ? undefined
-      : ProviderTransform.maxOutputTokens(
-          input.model.api.npm,
-          params.options,
-          input.model.limit.output,
-          OUTPUT_TOKEN_MAX,
-        )
+    const maxOutputTokens = isCodex ? undefined : undefined
+    const systemText = system.join("\n\n")
+    log.info("max_output_tokens", {
+      tokens: ProviderTransform.maxOutputTokens(
+        input.model.api.npm,
+        params.options,
+        input.model.limit.output,
+        OUTPUT_TOKEN_MAX,
+      ),
+      modelOptions: params.options,
+      outputLimit: input.model.limit.output,
+    })
+    // tokens = 32000
+    // outputLimit = 64000
+    // modelOptions={"reasoningEffort":"minimal"}
 
     const tools = await resolveTools(input)
 
@@ -180,6 +255,79 @@ export namespace LLM {
         execute: async () => ({ output: "", title: "", metadata: {} }),
       })
     }
+
+    const toolNames = Object.keys(tools)
+    l.info("核心/LLM/请求开始", {
+      sessionID: input.sessionID,
+      message: {
+        user: input.user.id,
+        model: `${input.model.providerID}/${input.model.id}`,
+      },
+      system: clipText(systemText),
+      messages: summarizeMessages(input.messages),
+      tools: {
+        count: toolNames.length,
+        names: toolNames,
+        liteProxy: isLiteLLMProxy,
+      },
+    })
+
+    const providerOptions = ProviderTransform.providerOptions(input.model, params.options)
+    const requestHeaders = {
+      ...(input.model.providerID.startsWith("opencode")
+        ? {
+            "x-opencode-project": Instance.project.id,
+            "x-opencode-session": input.sessionID,
+            "x-opencode-request": input.user.id,
+            "x-opencode-client": Flag.OPENCODE_CLIENT,
+          }
+        : input.model.providerID !== "anthropic"
+          ? {
+              "User-Agent": `opencode/${Installation.VERSION}`,
+            }
+          : undefined),
+      ...input.model.headers,
+        ...headers,
+    }
+    const requestMessages = [
+      ...(isCodex
+        ? [
+            {
+              role: "user",
+              content: system.join("\n\n"),
+            } as ModelMessage,
+          ]
+        : system.map(
+            (x): ModelMessage => ({
+              role: "system",
+              content: x,
+            }),
+          )),
+      ...input.messages,
+    ]
+    if (FULL_LOG) {
+      l.info("核心/LLM/请求原文", {
+        sessionID: input.sessionID,
+        model: `${input.model.providerID}/${input.model.id}`,
+        request: {
+          temperature: params.temperature,
+          topP: params.topP,
+          topK: params.topK,
+          providerOptions,
+          headers: Object.keys(requestHeaders),
+          activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+          messages: requestMessages,
+        },
+      })
+    }
+    l.debug("核心/LLM/请求参数", {
+      temperature: params.temperature,
+      topP: params.topP,
+      topK: params.topK,
+      options: redactValue(params.options),
+      providerOptions: redactValue(providerOptions),
+      headers: Object.keys(requestHeaders),
+    })
 
     return streamText({
       onError(error) {
@@ -211,44 +359,14 @@ export namespace LLM {
       temperature: params.temperature,
       topP: params.topP,
       topK: params.topK,
-      providerOptions: ProviderTransform.providerOptions(input.model, params.options),
+      providerOptions,
       activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
       tools,
       maxOutputTokens,
       abortSignal: input.abort,
-      headers: {
-        ...(input.model.providerID.startsWith("opencode")
-          ? {
-              "x-opencode-project": Instance.project.id,
-              "x-opencode-session": input.sessionID,
-              "x-opencode-request": input.user.id,
-              "x-opencode-client": Flag.OPENCODE_CLIENT,
-            }
-          : input.model.providerID !== "anthropic"
-            ? {
-                "User-Agent": `opencode/${Installation.VERSION}`,
-              }
-            : undefined),
-        ...input.model.headers,
-        ...headers,
-      },
+      headers: requestHeaders,
       maxRetries: input.retries ?? 0,
-      messages: [
-        ...(isCodex
-          ? [
-              {
-                role: "user",
-                content: system.join("\n\n"),
-              } as ModelMessage,
-            ]
-          : system.map(
-              (x): ModelMessage => ({
-                role: "system",
-                content: x,
-              }),
-            )),
-        ...input.messages,
-      ],
+      messages: requestMessages,
       model: wrapLanguageModel({
         model: language,
         middleware: [
@@ -264,13 +382,7 @@ export namespace LLM {
           extractReasoningMiddleware({ tagName: "think", startWithReasoning: false }),
         ],
       }),
-      experimental_telemetry: {
-        isEnabled: cfg.experimental?.openTelemetry,
-        metadata: {
-          userId: cfg.username ?? "unknown",
-          sessionId: input.sessionID,
-        },
-      },
+      experimental_telemetry: { isEnabled: cfg.experimental?.openTelemetry },
     })
   }
 

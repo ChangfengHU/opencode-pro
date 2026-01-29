@@ -17,8 +17,10 @@ import { Filesystem } from "../util/filesystem"
 import { Instance } from "../project/instance"
 import { Snapshot } from "@/snapshot"
 import { assertExternalDirectory } from "./external-directory"
+import { Log } from "../util/log"
 
 const MAX_DIAGNOSTICS_PER_FILE = 20
+const log = Log.create({ service: "edit-tool" })
 
 function normalizeLineEndings(text: string): string {
   return text.replaceAll("\r\n", "\n")
@@ -43,6 +45,12 @@ export const EditTool = Tool.define("edit", {
 
     const filePath = path.isAbsolute(params.filePath) ? params.filePath : path.join(Instance.directory, params.filePath)
     await assertExternalDirectory(ctx, filePath)
+    log.info("核心/文件/编辑开始", {
+      sessionID: ctx.sessionID,
+      file: filePath,
+      replaceAll: params.replaceAll ?? false,
+      size: params.newString.length,
+    })
 
     let diff = ""
     let contentOld = ""
@@ -142,6 +150,12 @@ export const EditTool = Tool.define("edit", {
       output += `\n\nLSP errors detected in this file, please fix:\n<diagnostics file="${filePath}">\n${limited.map(LSP.Diagnostic.pretty).join("\n")}${suffix}\n</diagnostics>`
     }
 
+    log.info("核心/文件/编辑结束", {
+      sessionID: ctx.sessionID,
+      file: filePath,
+      replaceAll: params.replaceAll ?? false,
+      size: contentNew.length,
+    })
     return {
       metadata: {
         diagnostics,

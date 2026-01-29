@@ -19,6 +19,64 @@ import { Question } from "@/question"
 export namespace SessionProcessor {
   const DOOM_LOOP_THRESHOLD = 3
   const log = Log.create({ service: "session.processor" })
+  const LOG_PREVIEW = 1200
+  const LOG_DEPTH = 6
+  const FULL_LOG = process.env.OPENCODE_LOG_LLM_FULL === "1"
+  const STREAM_LOG = process.env.OPENCODE_LOG_LLM_STREAM === "1"
+
+  function clipText(text: string, limit = LOG_PREVIEW) {
+    const size = text.length
+    if (size <= limit) {
+      return { text, size, clipped: false }
+    }
+    return { text: text.slice(0, limit) + "...", size, clipped: true }
+  }
+
+  function isSecretKey(key: string) {
+    const lower = key.toLowerCase()
+    if (lower.includes("authorization")) return true
+    if (lower.includes("apikey")) return true
+    if (lower.includes("api_key")) return true
+    if (lower.includes("token")) return true
+    if (lower.includes("secret")) return true
+    if (lower.includes("password")) return true
+    if (lower.includes("cookie")) return true
+    return lower.includes("key")
+  }
+
+  function redactValue(value: unknown, depth = 0): unknown {
+    if (value === null || value === undefined) return value
+    if (depth >= LOG_DEPTH) return "[max-depth]"
+    if (typeof value === "string") return clipText(value)
+    if (Array.isArray(value)) return value.map((item) => redactValue(item, depth + 1))
+    if (typeof value !== "object") return value
+    const record = value as Record<string, unknown>
+    const result: Record<string, unknown> = {}
+    for (const key of Object.keys(record)) {
+      if (isSecretKey(key)) {
+        result[key] = "[redacted]"
+        continue
+      }
+      result[key] = redactValue(record[key], depth + 1)
+    }
+    return result
+  }
+
+  function mapStreamEvent(value: any) {
+    const base = {
+      type: value.type,
+    } as Record<string, unknown>
+    if (value.id) base.id = value.id
+    if (value.toolName) base.tool = value.toolName
+    if (value.toolCallId) base.callID = value.toolCallId
+    if (value.text) base.text = clipText(String(value.text))
+    if (value.input) base.input = redactValue(value.input)
+    if (value.output?.output) base.output = clipText(String(value.output.output))
+    if (value.finishReason) base.finish = value.finishReason
+    if (value.providerMetadata) base.metadata = redactValue(value.providerMetadata)
+    if (value.usage) base.usage = redactValue(value.usage)
+    return base
+  }
 
   export type Info = Awaited<ReturnType<typeof create>>
   export type Result = Awaited<ReturnType<Info["process"]>>
@@ -43,16 +101,36 @@ export namespace SessionProcessor {
         return toolcalls[toolCallID]
       },
       async process(streamInput: LLM.StreamInput) {
-        log.info("process")
+        log.info("核心/会话/处理开始", {
+          sessionID: input.sessionID,
+          messageID: input.assistantMessage.id,
+          model: `${input.model.providerID}/${input.model.id}`,
+        })
         needsCompaction = false
         const shouldBreak = (await Config.get()).experimental?.continue_loop_on_deny !== true
         while (true) {
           try {
             let currentText: MessageV2.TextPart | undefined
             let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
+            const output = { text: "" }
+            let toolCalls = 0
+            let toolResults = 0
             const stream = await LLM.stream(streamInput)
+            log.info("核心/LLM/解析开始", {
+              sessionID: input.sessionID,
+              messageID: input.assistantMessage.id,
+              model: `${input.model.providerID}/${input.model.id}`,
+            })
 
             for await (const value of stream.fullStream) {
+              if (STREAM_LOG) {
+                log.info("核心/LLM/响应流", {
+                  sessionID: input.sessionID,
+                  messageID: input.assistantMessage.id,
+                  model: `${input.model.providerID}/${input.model.id}`,
+                  event: mapStreamEvent(value),
+                })
+              }
               input.abort.throwIfAborted()
               switch (value.type) {
                 case "start":
@@ -125,6 +203,14 @@ export namespace SessionProcessor {
 
                 case "tool-call": {
                   const match = toolcalls[value.toolCallId]
+                  toolCalls += 1
+                  log.info("核心/工具/调用", {
+                    sessionID: input.sessionID,
+                    messageID: input.assistantMessage.id,
+                    callID: value.toolCallId,
+                    tool: value.toolName,
+                    input: redactValue(value.input),
+                  })
                   if (match) {
                     const part = await Session.updatePart({
                       ...match,
@@ -172,6 +258,17 @@ export namespace SessionProcessor {
                 case "tool-result": {
                   const match = toolcalls[value.toolCallId]
                   if (match && match.state.status === "running") {
+                    toolResults += 1
+                    log.info("核心/工具/结果", {
+                      sessionID: input.sessionID,
+                      messageID: input.assistantMessage.id,
+                      callID: value.toolCallId,
+                      tool: match.tool,
+                      output: clipText(value.output.output),
+                      title: value.output.title,
+                      metadata: redactValue(value.output.metadata),
+                      attachments: value.output.attachments?.length ?? 0,
+                    })
                     await Session.updatePart({
                       ...match,
                       state: {
@@ -196,6 +293,15 @@ export namespace SessionProcessor {
                 case "tool-error": {
                   const match = toolcalls[value.toolCallId]
                   if (match && match.state.status === "running") {
+                    const err = value.error instanceof Error ? value.error.message : String(value.error)
+                    log.warn("核心/工具/错误", {
+                      sessionID: input.sessionID,
+                      messageID: input.assistantMessage.id,
+                      callID: value.toolCallId,
+                      tool: match.tool,
+                      input: redactValue(value.input ?? match.state.input),
+                      error: err,
+                    })
                     await Session.updatePart({
                       ...match,
                       state: {
@@ -238,6 +344,29 @@ export namespace SessionProcessor {
                     model: input.model,
                     usage: value.usage,
                     metadata: value.providerMetadata,
+                  })
+                  log.info("核心/LLM/输出汇总", {
+                    sessionID: input.sessionID,
+                    messageID: input.assistantMessage.id,
+                    model: `${input.model.providerID}/${input.model.id}`,
+                    text: clipText(output.text),
+                    toolCalls,
+                    toolResults,
+                  })
+                  if (FULL_LOG) {
+                    log.info("核心/LLM/响应原文", {
+                      sessionID: input.sessionID,
+                      messageID: input.assistantMessage.id,
+                      model: `${input.model.providerID}/${input.model.id}`,
+                      text: output.text,
+                    })
+                  }
+                  log.info("核心/LLM/完成", {
+                    sessionID: input.sessionID,
+                    messageID: input.assistantMessage.id,
+                    finish: value.finishReason,
+                    tokens: usage.tokens,
+                    cost: usage.cost,
                   })
                   input.assistantMessage.finish = value.finishReason
                   input.assistantMessage.cost += usage.cost
@@ -288,6 +417,11 @@ export namespace SessionProcessor {
                     },
                     metadata: value.providerMetadata,
                   }
+                  log.info("核心/流式/开始", {
+                    sessionID: input.sessionID,
+                    messageID: input.assistantMessage.id,
+                    model: `${input.model.providerID}/${input.model.id}`,
+                  })
                   break
 
                 case "text-delta":
@@ -299,12 +433,14 @@ export namespace SessionProcessor {
                         part: currentText,
                         delta: value.text,
                       })
+                    output.text += value.text
                   }
                   break
 
                 case "text-end":
                   if (currentText) {
                     currentText.text = currentText.text.trimEnd()
+                    output.text = output.text.trimEnd()
                     const textOutput = await Plugin.trigger(
                       "experimental.text.complete",
                       {
@@ -322,6 +458,11 @@ export namespace SessionProcessor {
                     if (value.providerMetadata) currentText.metadata = value.providerMetadata
                     await Session.updatePart(currentText)
                   }
+                  log.info("核心/流式/结束", {
+                    sessionID: input.sessionID,
+                    messageID: input.assistantMessage.id,
+                    model: `${input.model.providerID}/${input.model.id}`,
+                  })
                   currentText = undefined
                   break
 

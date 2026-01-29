@@ -21,6 +21,15 @@ const MAX_METADATA_LENGTH = 30_000
 const DEFAULT_TIMEOUT = Flag.OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS || 2 * 60 * 1000
 
 export const log = Log.create({ service: "bash-tool" })
+const LOG_PREVIEW = 1200
+
+const clipText = (text: string, limit = LOG_PREVIEW) => {
+  const size = text.length
+  if (size <= limit) {
+    return { text, size, clipped: false }
+  }
+  return { text: text.slice(0, limit) + "...", size, clipped: true }
+}
 
 const resolveWasm = (asset: string) => {
   if (asset.startsWith("file://")) return fileURLToPath(asset)
@@ -75,11 +84,18 @@ export const BashTool = Tool.define("bash", async () => {
         ),
     }),
     async execute(params, ctx) {
+      const start = Date.now()
       const cwd = params.workdir || Instance.directory
       if (params.timeout !== undefined && params.timeout < 0) {
         throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
       }
       const timeout = params.timeout ?? DEFAULT_TIMEOUT
+      log.info("核心/Bash/执行开始", {
+        sessionID: ctx.sessionID,
+        cwd,
+        timeout,
+        command: clipText(params.command),
+      })
       const tree = await parser().then((p) => p.parse(params.command))
       if (!tree) {
         throw new Error("Failed to parse command")
@@ -244,6 +260,13 @@ export const BashTool = Tool.define("bash", async () => {
         output += "\n\n<bash_metadata>\n" + resultMetadata.join("\n") + "\n</bash_metadata>"
       }
 
+      log.info("核心/Bash/执行结束", {
+        sessionID: ctx.sessionID,
+        cwd,
+        exit: proc.exitCode,
+        duration: Date.now() - start,
+        output: clipText(output),
+      })
       return {
         title: params.description,
         metadata: {

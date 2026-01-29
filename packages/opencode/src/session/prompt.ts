@@ -53,6 +53,70 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
   export const OUTPUT_TOKEN_MAX = Flag.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX || 32_000
+  const LOG_PREVIEW = 1200
+  const LOG_DEPTH = 6
+
+  function clipText(text: string, limit = LOG_PREVIEW) {
+    const size = text.length
+    if (size <= limit) {
+      return { text, size, clipped: false }
+    }
+    return { text: text.slice(0, limit) + "...", size, clipped: true }
+  }
+
+  function isSecretKey(key: string) {
+    const lower = key.toLowerCase()
+    if (lower.includes("authorization")) return true
+    if (lower.includes("apikey")) return true
+    if (lower.includes("api_key")) return true
+    if (lower.includes("token")) return true
+    if (lower.includes("secret")) return true
+    if (lower.includes("password")) return true
+    if (lower.includes("cookie")) return true
+    return lower.includes("key")
+  }
+
+  function redactValue(value: unknown, depth = 0): unknown {
+    if (value === null || value === undefined) return value
+    if (depth >= LOG_DEPTH) return "[max-depth]"
+    if (typeof value === "string") return clipText(value)
+    if (Array.isArray(value)) return value.map((item) => redactValue(item, depth + 1))
+    if (typeof value !== "object") return value
+    const record = value as Record<string, unknown>
+    const result: Record<string, unknown> = {}
+    for (const key of Object.keys(record)) {
+      if (isSecretKey(key)) {
+        result[key] = "[redacted]"
+        continue
+      }
+      result[key] = redactValue(record[key], depth + 1)
+    }
+    return result
+  }
+
+  function summarizeParts(parts: Array<{ type: string; text?: string; filename?: string; name?: string }>) {
+    const types: Record<string, number> = {}
+    let size = 0
+    for (const part of parts) {
+      types[part.type] = (types[part.type] ?? 0) + 1
+      if (part.type === "text") size += part.text.length
+      if (part.type === "file" && part.filename) size += part.filename.length
+      if (part.type === "agent") size += part.name.length
+    }
+    return { count: parts.length, types, size }
+  }
+
+  function summarizeContext(messages: MessageV2.WithParts[]) {
+    const types: Record<string, number> = {}
+    let count = 0
+    for (const msg of messages) {
+      for (const part of msg.parts) {
+        types[part.type] = (types[part.type] ?? 0) + 1
+        count += 1
+      }
+    }
+    return { messages: messages.length, parts: count, types }
+  }
 
   const state = Instance.state(
     () => {
@@ -152,6 +216,14 @@ export namespace SessionPrompt {
   export const prompt = fn(PromptInput, async (input) => {
     const session = await Session.get(input.sessionID)
     await SessionRevert.cleanup(session)
+    log.info("核心/会话/收到用户消息", {
+      sessionID: input.sessionID,
+      messageID: input.messageID,
+      agent: input.agent,
+      model: input.model,
+      parts: summarizeParts(input.parts),
+      noReply: input.noReply,
+    })
 
     const message = await createUserMessage(input)
     await Session.touch(input.sessionID)
@@ -271,9 +343,13 @@ export namespace SessionPrompt {
     const session = await Session.get(sessionID)
     while (true) {
       SessionStatus.set(sessionID, { type: "busy" })
-      log.info("loop", { step, sessionID })
+      log.info("核心/流程/循环", { step, sessionID })
       if (abort.aborted) break
       let msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
+      log.info("核心/上下文/加载", {
+        sessionID,
+        context: summarizeContext(msgs),
+      })
 
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
@@ -298,11 +374,12 @@ export namespace SessionPrompt {
         !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
         lastUser.id < lastAssistant.id
       ) {
-        log.info("exiting loop", { sessionID })
+        log.info("核心/流程/结束", { sessionID, reason: "assistant_finished" })
         break
       }
 
       step++
+      log.info("核心/流程/步骤", { sessionID, step })
       if (step === 1)
         ensureTitle({
           session,
@@ -317,6 +394,11 @@ export namespace SessionPrompt {
       // pending subtask
       // TODO: centralize "invoke tool" logic
       if (task?.type === "subtask") {
+        log.info("核心/流程/子任务", {
+          sessionID,
+          agent: task.agent,
+          command: task.command,
+        })
         const taskTool = await TaskTool.init()
         const taskModel = task.model ? await Provider.getModel(task.model.providerID, task.model.modelID) : model
         const assistantMessage = (await Session.updateMessage({
@@ -378,6 +460,13 @@ export namespace SessionPrompt {
           },
           { args: taskArgs },
         )
+        log.info("核心/工具/执行开始", {
+          sessionID,
+          messageID: assistantMessage.id,
+          callID: part.id,
+          tool: "task",
+          args: redactValue(taskArgs),
+        })
         let executionError: Error | undefined
         const taskAgent = await Agent.get(task.agent)
         const taskCtx: Tool.Context = {
@@ -411,6 +500,20 @@ export namespace SessionPrompt {
           log.error("subtask execution failed", { error, agent: task.agent, description: task.description })
           return undefined
         })
+        if (result) {
+          log.info("核心/工具/执行结束", {
+            sessionID,
+            messageID: assistantMessage.id,
+            callID: part.id,
+            tool: "task",
+            result: {
+              title: result.title,
+              metadata: redactValue(result.metadata),
+              output: clipText(result.output),
+              attachments: result.attachments?.length ?? 0,
+            },
+          })
+        }
         await Plugin.trigger(
           "tool.execute.after",
           {
@@ -486,6 +589,7 @@ export namespace SessionPrompt {
 
       // pending compaction
       if (task?.type === "compaction") {
+        log.info("核心/流程/压缩", { sessionID, auto: task.auto })
         const result = await SessionCompaction.process({
           messages: msgs,
           parentID: lastUser.id,
@@ -503,6 +607,7 @@ export namespace SessionPrompt {
         lastFinished.summary !== true &&
         (await SessionCompaction.isOverflow({ tokens: lastFinished.tokens, model }))
       ) {
+        log.info("核心/流程/压缩", { sessionID, auto: true })
         await SessionCompaction.create({
           sessionID,
           agent: lastUser.agent,
@@ -514,6 +619,11 @@ export namespace SessionPrompt {
 
       // normal processing
       const agent = await Agent.get(lastUser.agent)
+      log.info("核心/Agent/选择", {
+        sessionID,
+        agent: agent.name,
+        model: agent.model,
+      })
       const maxSteps = agent.steps ?? Infinity
       const isLastStep = step >= maxSteps
       msgs = await insertReminders({
@@ -597,12 +707,33 @@ export namespace SessionPrompt {
 
       await Plugin.trigger("experimental.chat.messages.transform", {}, { messages: sessionMessages })
 
+      const systemParts = [...(await SystemPrompt.environment(model)), ...(await InstructionPrompt.system())]
+      const systemText = systemParts.join("\n\n")
+      log.info("核心/记忆/上下文", {
+        sessionID,
+        context: summarizeContext(sessionMessages),
+        system: {
+          count: systemParts.length,
+          text: clipText(systemText),
+        },
+        tools: Object.keys(tools).length,
+      })
+
+      log.info("核心/提示词/构建", {
+        sessionID,
+        agent: agent.name,
+        model: `${model.providerID}/${model.id}`,
+        system: systemParts.length,
+        messages: sessionMessages.length,
+        tools: Object.keys(tools).length,
+      })
+      log.info("核心/流程/调用LLM", { sessionID, step })
       const result = await processor.process({
         user: lastUser,
         agent,
         abort,
         sessionID,
-        system: [...(await SystemPrompt.environment(model)), ...(await InstructionPrompt.system())],
+        system: systemParts,
         messages: [
           ...MessageV2.toModelMessages(sessionMessages, model),
           ...(isLastStep
@@ -617,14 +748,36 @@ export namespace SessionPrompt {
         tools,
         model,
       })
-      if (result === "stop") break
+      log.info("核心/流程/解析结果", {
+        sessionID,
+        step,
+        result,
+        finish: processor.message.finish,
+        error: !!processor.message.error,
+      })
+      log.info("核心/上下文/更新", {
+        sessionID,
+        messageID: processor.message.id,
+        finish: processor.message.finish,
+      })
+      if (result === "stop") {
+        log.info("核心/流程/结束", {
+          sessionID,
+          reason: processor.message.error ? "error" : "stop",
+        })
+        break
+      }
       if (result === "compact") {
+        log.info("核心/流程/进入压缩", { sessionID, step })
         await SessionCompaction.create({
           sessionID,
           agent: lastUser.agent,
           model: lastUser.model,
           auto: true,
         })
+      }
+      if (result === "continue") {
+        log.info("核心/流程/继续", { sessionID, step })
       }
       continue
     }
@@ -705,6 +858,13 @@ export namespace SessionPrompt {
         inputSchema: jsonSchema(schema as any),
         async execute(args, options) {
           const ctx = context(args, options)
+          log.info("核心/工具/执行开始", {
+            sessionID: ctx.sessionID,
+            messageID: ctx.messageID,
+            callID: ctx.callID,
+            tool: item.id,
+            args: redactValue(args),
+          })
           await Plugin.trigger(
             "tool.execute.before",
             {
@@ -717,6 +877,18 @@ export namespace SessionPrompt {
             },
           )
           const result = await item.execute(args, ctx)
+          log.info("核心/工具/执行结束", {
+            sessionID: ctx.sessionID,
+            messageID: ctx.messageID,
+            callID: ctx.callID,
+            tool: item.id,
+            result: {
+              title: result.title,
+              metadata: redactValue(result.metadata),
+              output: clipText(result.output),
+              attachments: result.attachments?.length ?? 0,
+            },
+          })
           await Plugin.trigger(
             "tool.execute.after",
             {
@@ -738,6 +910,14 @@ export namespace SessionPrompt {
       // Wrap execute to add plugin hooks and format output
       item.execute = async (args, opts) => {
         const ctx = context(args, opts)
+
+        log.info("核心/工具/执行开始", {
+          sessionID: ctx.sessionID,
+          messageID: ctx.messageID,
+          callID: opts.toolCallId,
+          tool: key,
+          args: redactValue(args),
+        })
 
         await Plugin.trigger(
           "tool.execute.before",
@@ -811,6 +991,19 @@ export namespace SessionPrompt {
           ...(truncated.truncated && { outputPath: truncated.outputPath }),
         }
 
+        log.info("核心/工具/执行结束", {
+          sessionID: ctx.sessionID,
+          messageID: ctx.messageID,
+          callID: opts.toolCallId,
+          tool: key,
+          result: {
+            title: "",
+            metadata: redactValue(metadata),
+            output: clipText(truncated.content),
+            attachments: attachments.length,
+          },
+        })
+
         return {
           title: "",
           metadata,
@@ -827,6 +1020,12 @@ export namespace SessionPrompt {
 
   async function createUserMessage(input: PromptInput) {
     const agent = await Agent.get(input.agent ?? (await Agent.defaultAgent()))
+    log.info("核心/Agent/初始化", {
+      sessionID: input.sessionID,
+      requested: input.agent,
+      agent: agent.name,
+      model: input.model ?? agent.model,
+    })
     const info: MessageV2.Info = {
       id: input.messageID ?? Identifier.ascending("message"),
       role: "user",
@@ -921,6 +1120,12 @@ export namespace SessionPrompt {
           switch (url.protocol) {
             case "data:":
               if (part.mime === "text/plain") {
+                log.info("核心/文件/检查", {
+                  sessionID: input.sessionID,
+                  source: "data",
+                  mime: part.mime,
+                  filename: part.filename,
+                })
                 return [
                   {
                     id: Identifier.ascending("part"),
@@ -949,6 +1154,12 @@ export namespace SessionPrompt {
               break
             case "file:":
               log.info("file", { mime: part.mime })
+              log.info("核心/文件/检查", {
+                sessionID: input.sessionID,
+                source: "file",
+                mime: part.mime,
+                filename: part.filename,
+              })
               // have to normalize, symbol search returns absolute paths
               // Decode the pathname since URL constructor doesn't automatically decode it
               const filepath = fileURLToPath(part.url)
@@ -1170,6 +1381,22 @@ export namespace SessionPrompt {
         ]
       }),
     ).then((x) => x.flat())
+
+    const types: Record<string, number> = {}
+    for (const part of parts) {
+      types[part.type] = (types[part.type] ?? 0) + 1
+    }
+    log.info("核心/消息/创建", {
+      sessionID: info.sessionID,
+      messageID: info.id,
+      role: info.role,
+      agent: info.agent,
+      model: info.model,
+      parts: {
+        count: parts.length,
+        types,
+      },
+    })
 
     await Plugin.trigger(
       "chat.message",

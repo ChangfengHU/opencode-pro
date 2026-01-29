@@ -113,6 +113,7 @@ export namespace InstructionPrompt {
   export async function system() {
     const config = await Config.get()
     const paths = await systemPaths()
+    log.debug("核心/指令/路径", { count: paths.size, paths: Array.from(paths) })
 
     const files = Array.from(paths).map(async (p) => {
       const content = await Bun.file(p)
@@ -136,7 +137,11 @@ export namespace InstructionPrompt {
         .then((x) => (x ? "Instructions from: " + url + "\n" + x : "")),
     )
 
-    return Promise.all([...files, ...fetches]).then((result) => result.filter(Boolean))
+    return Promise.all([...files, ...fetches]).then((result) => {
+      const loaded = result.filter(Boolean)
+      log.debug("核心/指令/已加载", { files: paths.size, urls: urls.length, loaded: loaded.length })
+      return loaded
+    })
   }
 
   export function loaded(messages: MessageV2.WithParts[]) {
