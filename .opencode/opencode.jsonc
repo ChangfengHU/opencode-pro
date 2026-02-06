@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  // "plugin": ["opencode-openai-codex-auth"],
+  "plugin": ["file:///Users/huchangfeng/opencode-study/opencode/packages/opencode/.opencode/plugin/minimal.ts"],
   // "enterprise": {
   //   "url": "https://enterprise.dev.opencode.ai",
   // },
